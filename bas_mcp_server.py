@@ -1549,6 +1549,91 @@ Returns: {success: true, action_id: new_id, mapped_params: {...}}""",
                 "required": ["template_id", "values"]
             }
         },
+        {
+            "name": "bas_get_module_schema",
+            "description": """Get detailed schema for a BAS custom module.
+
+Returns parameter definitions including:
+- Random parameter IDs and their readable descriptions
+- Default values for each parameter
+- Available variants/options (like dropdown lists)
+- Data types (string, int, variable)
+
+This is essential for creating module actions with correct parameters!
+
+Example usage:
+1. Find module name from existing action using bas_get_project or bas_analyze_module
+2. Call bas_get_module_schema(module_name="GoodXevilPaySolver_GXP_ReCaptcha_Bypass_No_Exten", action_id=12345)
+3. Use the returned schema to create new actions with correct params and defaults
+
+Returns: {
+    success: true,
+    module_name: "...",
+    params: [
+        {id: "xknmvqbc", description: "Solve Service", data_type: "string", default_value: "SCTG", variants: ["SCTG", "Multibot"]},
+        {id: "pmvdseyg", description: "ApiKey", data_type: "string", default_value: ""},
+        ...
+    ],
+    code_params: {"apikey": "apikey", "service_solver": "Service_Solver", ...}
+}""",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "module_name": {
+                        "type": "string",
+                        "description": "Full module name (e.g., 'GoodXevilPaySolver_GXP_ReCaptcha_Bypass_No_Exten')"
+                    },
+                    "action_id": {
+                        "type": "integer",
+                        "description": "Optional: ID of existing action to get code-to-param mapping"
+                    }
+                },
+                "required": ["module_name"]
+            }
+        },
+        {
+            "name": "bas_clone_module_action",
+            "description": """Clone a BAS module action with modified parameters.
+
+This is the RECOMMENDED way to create new module actions!
+It properly handles Dat JSON encoding and JavaScript code updates.
+
+Workflow:
+1. Get schema: bas_get_module_schema(module_name, template_id)
+2. Find param IDs you need to change from schema
+3. Clone with new values: bas_clone_module_action(template_id, new_params)
+
+Example:
+  Schema shows: pmvdseyg -> ApiKey, xknmvqbc -> Solve Service
+  Clone: bas_clone_module_action(
+      template_id=12345,
+      new_params={"pmvdseyg": "{{apikey}}", "xknmvqbc": "Multibot"}
+  )
+
+Resources syntax in params:
+  - "{{resource_name}}" - get value from resource
+  - "{{resource_name|notreuse}}" - force get NEW value
+
+Returns: {success: true, action_id: new_id, updated_params: {...}}""",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "template_id": {
+                        "type": "integer",
+                        "description": "ID of existing module action to clone"
+                    },
+                    "new_params": {
+                        "type": "object",
+                        "description": "Dict mapping param ID to new value, e.g., {'pmvdseyg': '{{apikey}}'}"
+                    },
+                    "comment": {
+                        "type": "string",
+                        "description": "Optional comment for the new action"
+                    }
+                },
+                "required": ["template_id", "new_params"]
+            }
+        },
 
         # ============= ACTION HELP =============
         {
@@ -1888,6 +1973,23 @@ async def call_tool_async(name: str, args: Dict[str, Any]) -> Dict[str, Any]:
             return await _client.create_module_action_from_template(
                 template_id, values, after_id, parent_id, comment
             )
+
+        elif name == "bas_get_module_schema":
+            module_name = args.get("module_name", "")
+            action_id = args.get("action_id")
+            if not module_name:
+                return {"error": "module_name is required"}
+            return await _client.get_module_schema(module_name, action_id)
+
+        elif name == "bas_clone_module_action":
+            template_id = args.get("template_id", 0)
+            new_params = args.get("new_params", {})
+            comment = args.get("comment", "")
+            if not template_id:
+                return {"error": "template_id is required"}
+            if not new_params:
+                return {"error": "new_params dict is required"}
+            return await _client.clone_module_action(template_id, new_params, comment)
 
         # ============= ACTION HELP =============
         elif name == "bas_get_action_help":

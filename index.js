@@ -224,8 +224,21 @@ class BASHelper {
         }
         else if(Message.type == "get-resources")
         {
-            let result = this.GetResourcesList();
+            let result = await this.GetResourcesList();
             this.SendMessage("get-resources-result", Message.id, result)
+        }
+        else if(Message.type == "check-resources")
+        {
+            // Check which resources from a list actually exist
+            let names = Message.data.names || [];
+            let result = await this.CheckResourcesExist(names);
+            this.SendMessage("check-resources-result", Message.id, result)
+        }
+        else if(Message.type == "probe-resources")
+        {
+            // Probe common resource names to find which exist
+            let result = await this.ProbeResources();
+            this.SendMessage("probe-resources-result", Message.id, result)
         }
         else if(Message.type == "get-resource")
         {
@@ -236,6 +249,20 @@ class BASHelper {
         {
             let result = await this.EvalExpression(Message.data.expression);
             this.SendMessage("eval-result", Message.id, result)
+        }
+        else if(Message.type == "get-module-schema")
+        {
+            let result = await this.GetModuleSchema(Message.data.module_name, Message.data.action_id);
+            this.SendMessage("get-module-schema-result", Message.id, result)
+        }
+        else if(Message.type == "clone-module-action")
+        {
+            let result = await this.CloneModuleAction(
+                Message.data.template_id,
+                Message.data.new_params || {},
+                Message.data.comment
+            );
+            this.SendMessage("clone-module-action-result", Message.id, result)
         }
         else if(Message.type == "cancel")
         {
@@ -1123,16 +1150,72 @@ class BASHelper {
         }
 
         try {
-            await BrowserAutomationStudio_LockRender(async () => {
-                if(comment !== undefined) {
-                    task.set('name', comment);
-                }
+            let code = task.get('code') || '';
+            let isModuleAction = code.includes('/*Dat:');
+            let updatedParams = {};
 
-                if(Object.keys(params).length > 0) {
+            // Update comment
+            if(comment !== undefined) {
+                task.set('name', comment);
+            }
+
+            if(Object.keys(params).length > 0) {
+                if(isModuleAction) {
+                    // For module actions, update the code field directly
+                    let datStart = code.indexOf('/*Dat:') + 6;
+                    let datEnd = code.indexOf('*/', datStart);
+                    let datB64 = code.substring(datStart, datEnd);
+
+                    let datJson;
+                    try {
+                        datJson = JSON.parse(decodeURIComponent(escape(atob(datB64))));
+                    } catch(e) {
+                        datJson = JSON.parse(atob(datB64));
+                    }
+
+                    // Update params in datJson.d
+                    for(let p of datJson.d) {
+                        if(params[p.id] !== undefined) {
+                            updatedParams[p.id] = {old: p.data, new: params[p.id]};
+                            p.data = String(params[p.id]);
+                            p.is_def = false;
+                        }
+                    }
+
+                    // Re-encode Dat
+                    let newDatB64 = btoa(unescape(encodeURIComponent(JSON.stringify(datJson))));
+                    let newCode = code.substring(0, datStart) + newDatB64 + code.substring(datEnd);
+
+                    // Update JavaScript call part
+                    let jsStart = code.indexOf('_call_function(');
+                    if(jsStart > 0) {
+                        let jsEnd = code.indexOf(')!', jsStart);
+                        if(jsEnd > jsStart) {
+                            let jsPart = code.substring(jsStart, jsEnd + 2);
+                            let newJsPart = jsPart;
+
+                            for(let [paramId, mapping] of Object.entries(updatedParams)) {
+                                let oldVal = mapping.old;
+                                let newVal = mapping.new;
+                                newJsPart = newJsPart.split(`("${oldVal}")`).join(`("${newVal}")`);
+                                if(!isNaN(oldVal)) {
+                                    newJsPart = newJsPart.split(`(${oldVal})`).join(`(${newVal})`);
+                                }
+                            }
+
+                            newCode = newCode.substring(0, jsStart) + newJsPart + newCode.substring(jsEnd + 2);
+                        }
+                    }
+
+                    task.set('code', newCode);
+
+                } else {
+                    // For regular actions, update dat_precomputed
                     let dat = task.get('dat') || task.get('dat_precomputed');
                     if(dat && dat.d) {
                         dat.d.forEach(param => {
                             if(params[param.id] !== undefined) {
+                                updatedParams[param.id] = {old: param.data, new: params[param.id]};
                                 param.data = String(params[param.id]);
                                 param.is_def = false;
                             }
@@ -1141,16 +1224,25 @@ class BASHelper {
                         task.attributes["code_precomputed"] = null;
                     }
                 }
-            }, false);
+            }
 
+            // Compile the action
+            window.App.overlay.show();
             await new Promise(resolve => {
                 _ActionUpdater.model.once('finish', resolve).set({
-                    tasks: [task],
+                    tasks: App.utils.filterTasks('all', [task]),
                     isStarted: true,
                 });
             });
+            window.App.overlay.hide();
 
-            return {success: true, action_id: actionId};
+            let success = _ActionUpdater.model.isSuccessfulUpdate();
+            return {
+                success: success,
+                action_id: actionId,
+                updated_params: updatedParams,
+                error: success ? undefined : "Compilation failed"
+            };
         } catch(e) {
             return {success: false, error: e.toString()};
         }
@@ -1472,27 +1564,49 @@ class BASHelper {
 
     // ============= RESOURCES =============
 
-    GetResourcesList()
+    async GetResourcesList()
     {
         try {
-            let resources = [];
+            let resources = new Set();
 
-            // Parse resources from code using extract_resources pattern
+            // Method 1: Parse RCreate from compiled code
             if(typeof _CodeContainer !== 'undefined' && _CodeContainer.GetCode) {
                 let code = _CodeContainer.GetCode();
                 let regexp = /RCreate\("([^"]+)"/g;
                 let matches;
                 while((matches = regexp.exec(code)) !== null) {
-                    if(!resources.includes(matches[1])) {
-                        resources.push(matches[1]);
+                    resources.add(matches[1]);
+                }
+            }
+
+            // Method 2: Parse {{resource}} and {{resource|options}} from action code
+            if(typeof _TaskCollection !== 'undefined') {
+                _TaskCollection.each(task => {
+                    let code = task.get('code') || '';
+                    let name = task.get('name') || '';
+                    let allText = code + ' ' + name;
+
+                    // Match {{resource}} and {{resource|option}}
+                    let regexp = /\{\{([a-zA-Z_][a-zA-Z0-9_]*)(?:\|[^}]*)?\}\}/g;
+                    let matches;
+                    while((matches = regexp.exec(allText)) !== null) {
+                        resources.add(matches[1]);
                     }
+                });
+            }
+
+            // Method 3: Fallback - probe common resource names if nothing found
+            if(resources.size === 0) {
+                let probed = await this.ProbeResources();
+                if(probed.resources && probed.resources.length > 0) {
+                    probed.resources.forEach(r => resources.add(r.name));
                 }
             }
 
             return {
                 success: true,
-                resources: resources,
-                count: resources.length
+                resources: Array.from(resources),
+                count: resources.size
             };
         } catch(e) {
             return {success: false, error: e.toString()};
@@ -1536,6 +1650,58 @@ class BASHelper {
         } catch(e) {
             return {success: false, error: e.toString(), name: resourceName};
         }
+    }
+
+    async CheckResourcesExist(names)
+    {
+        let existing = [];
+        let notFound = [];
+
+        for(let name of names) {
+            try {
+                let result = await this.GetResourceValue(name);
+                if(result.success && result.value !== undefined && result.value !== null) {
+                    existing.push({name: name, value: result.value});
+                } else {
+                    notFound.push(name);
+                }
+            } catch(e) {
+                notFound.push(name);
+            }
+        }
+
+        return {
+            success: true,
+            existing: existing,
+            not_found: notFound
+        };
+    }
+
+    async ProbeResources()
+    {
+        // Common resource names to probe
+        let commonNames = [
+            'proxy', 'proxies', 'account', 'accounts', 'login', 'password',
+            'email', 'phone', 'number', 'country', 'country_code',
+            'apikey', 'api_key', 'token', 'data', 'input', 'output',
+            'user', 'username', 'pass', 'url', 'urls', 'link', 'links'
+        ];
+
+        let found = [];
+        for(let name of commonNames) {
+            try {
+                let result = await this.GetResourceValue(name);
+                if(result.success && result.value !== undefined && result.value !== null) {
+                    found.push({name: name, value: result.value});
+                }
+            } catch(e) {}
+        }
+
+        return {
+            success: true,
+            resources: found,
+            count: found.length
+        };
     }
 
     // ============= EVAL EXPRESSION =============
@@ -1655,6 +1821,333 @@ class BASHelper {
         } catch(e) {
             window.App.overlay.hide();
             return [];
+        }
+    }
+
+    // ============= MODULE SCHEMA =============
+
+    async GetModuleSchema(moduleName, actionId)
+    {
+        try {
+            let result = {
+                success: true,
+                module_name: moduleName,
+                params: []
+            };
+
+            // If action_id provided, parse the code field for param name mapping
+            let codeParamMap = {};
+            if(actionId) {
+                let task = FindTaskById(actionId);
+                if(task) {
+                    let code = task.get('code') || '';
+                    // Parse: { "readable_name": (value), ... }
+                    // Pattern: "param_name": (anything)
+                    let paramRegex = /"([^"]+)":\s*\(/g;
+                    let match;
+                    while((match = paramRegex.exec(code)) !== null) {
+                        let readableName = match[1];
+                        codeParamMap[readableName.toLowerCase()] = readableName;
+                    }
+                    result.code_params = codeParamMap;
+                }
+            }
+
+            // Try to load interface.js file for this module
+            if(moduleName) {
+                let interfaceHtml = await this.LoadModuleInterface(moduleName);
+                if(interfaceHtml) {
+                    result.params = this.ParseModuleInterface(interfaceHtml, codeParamMap);
+                    result.interface_loaded = true;
+                } else {
+                    result.interface_loaded = false;
+                    result.interface_error = "Could not load interface file";
+                }
+            }
+
+            return result;
+        } catch(e) {
+            return {success: false, error: e.toString()};
+        }
+    }
+
+    async LoadModuleInterface(moduleName)
+    {
+        // Module files are in custom/<ModuleFolder>/<ModuleName>_interface.js
+        // Extract module folder from module name (e.g., GoodXevilPaySolver_GXP_... -> GoodXevilPaySolver)
+        let parts = moduleName.split('_');
+        let moduleFolder = parts[0];
+
+        // Build possible paths
+        let paths = [
+            `../../custom/${moduleFolder}/${moduleName}_interface.js`,
+            `../../../custom/${moduleFolder}/${moduleName}_interface.js`,
+        ];
+
+        for(let path of paths) {
+            try {
+                let response = await fetch(path);
+                if(response.ok) {
+                    return await response.text();
+                }
+            } catch(e) {
+                // Try next path
+            }
+        }
+
+        // Try to find in external folders
+        // These have numeric IDs like external/6508/ModuleFolder/...
+        // We can't enumerate them easily, so skip for now
+
+        return null;
+    }
+
+    ParseModuleInterface(html, codeParamMap)
+    {
+        let params = [];
+
+        // Parse input_constructor calls
+        // Pattern: {id:"xxx", description:"yyy", variants: [...], value_string: "zzz", ...}
+        let constructorRegex = /input_constructor[^{]*\(\{([^}]+)\}\)/g;
+        let match;
+
+        while((match = constructorRegex.exec(html)) !== null) {
+            let content = match[1];
+            let param = this.ParseConstructorParams(content, codeParamMap);
+            if(param) {
+                params.push(param);
+            }
+        }
+
+        // Parse variable_constructor calls (for Save params)
+        let varRegex = /variable_constructor[^{]*\(\{([^}]+)\}\)/g;
+        while((match = varRegex.exec(html)) !== null) {
+            let content = match[1];
+            let param = this.ParseVariableConstructor(content);
+            if(param) {
+                params.push(param);
+            }
+        }
+
+        return params;
+    }
+
+    ParseConstructorParams(content, codeParamMap)
+    {
+        try {
+            let param = {
+                type: 'input'
+            };
+
+            // Extract id
+            let idMatch = content.match(/id:\s*"([^"]+)"/);
+            if(idMatch) param.id = idMatch[1];
+
+            // Extract description (readable name)
+            let descMatch = content.match(/description:\s*"([^"]+)"/);
+            if(descMatch) param.description = descMatch[1];
+
+            // Extract default_selector (type)
+            let typeMatch = content.match(/default_selector:\s*"([^"]+)"/);
+            if(typeMatch) param.data_type = typeMatch[1];
+
+            // Extract variants (list of options)
+            let variantsMatch = content.match(/variants:\s*\[([^\]]+)\]/);
+            if(variantsMatch) {
+                let variantsStr = variantsMatch[1];
+                // Parse array: "a", "b" or 0, 1
+                let items = [];
+                let itemRegex = /"([^"]+)"|(\d+)/g;
+                let itemMatch;
+                while((itemMatch = itemRegex.exec(variantsStr)) !== null) {
+                    items.push(itemMatch[1] || itemMatch[2]);
+                }
+                param.variants = items;
+            }
+
+            // Extract default value
+            let valueStringMatch = content.match(/value_string:\s*"([^"]*)"/);
+            if(valueStringMatch) param.default_value = valueStringMatch[1];
+
+            let valueNumberMatch = content.match(/value_number:\s*(\d+)/);
+            if(valueNumberMatch) param.default_value = parseInt(valueNumberMatch[1]);
+
+            // Extract help description
+            let helpMatch = content.match(/description:\s*"(<div>[^"]+)"/g);
+            if(helpMatch && helpMatch.length > 1) {
+                // Second description is from help object
+                let helpText = helpMatch[1].match(/description:\s*"([^"]+)"/);
+                if(helpText) {
+                    // Strip HTML tags
+                    param.help = helpText[1].replace(/<[^>]+>/g, ' ').trim();
+                }
+            }
+
+            // Map to code param name if available
+            if(param.description && codeParamMap) {
+                let lowerDesc = param.description.toLowerCase();
+                if(codeParamMap[lowerDesc]) {
+                    param.code_name = codeParamMap[lowerDesc];
+                }
+            }
+
+            return param.id ? param : null;
+        } catch(e) {
+            return null;
+        }
+    }
+
+    ParseVariableConstructor(content)
+    {
+        try {
+            let param = {
+                type: 'variable'
+            };
+
+            // Extract id
+            let idMatch = content.match(/id:\s*"([^"]+)"/);
+            if(idMatch) param.id = idMatch[1];
+
+            // Extract description
+            let descMatch = content.match(/description:\s*"([^"]+)"/);
+            if(descMatch) param.description = descMatch[1];
+
+            // Extract default_variable
+            let defaultMatch = content.match(/default_variable:\s*"([^"]+)"/);
+            if(defaultMatch) param.default_value = defaultMatch[1];
+
+            param.data_type = 'variable';
+
+            return param.id ? param : null;
+        } catch(e) {
+            return null;
+        }
+    }
+
+    // ============= CLONE MODULE ACTION =============
+
+    async CloneModuleAction(templateId, newParams, comment)
+    {
+        try {
+            // Find the template task
+            let template = FindTaskById(templateId);
+            if(!template) {
+                return {success: false, error: "Template action not found"};
+            }
+
+            let code = template.get('code') || '';
+            if(!code.includes('/*Dat:')) {
+                return {success: false, error: "Not a module action (no Dat found)"};
+            }
+
+            // Parse the Dat JSON from code
+            let datStart = code.indexOf('/*Dat:') + 6;
+            let datEnd = code.indexOf('*/', datStart);
+            let datB64 = code.substring(datStart, datEnd);
+
+            // Decode base64 properly (handle UTF-8)
+            let datJson;
+            try {
+                datJson = JSON.parse(decodeURIComponent(escape(atob(datB64))));
+            } catch(e) {
+                datJson = JSON.parse(atob(datB64));
+            }
+
+            // Update parameters in datJson.d array
+            let paramMapping = {};
+            for(let p of datJson.d) {
+                let paramId = p.id;
+                if(newParams[paramId] !== undefined) {
+                    paramMapping[paramId] = {old: p.data, new: newParams[paramId]};
+                    p.data = String(newParams[paramId]);
+                    p.is_def = false;
+                }
+            }
+
+            // Re-encode Dat (match original format)
+            let newDatB64 = btoa(unescape(encodeURIComponent(JSON.stringify(datJson))));
+            let newCode = code.substring(0, datStart) + newDatB64 + code.substring(datEnd);
+
+            // Update JavaScript call part - replace values in the function call
+            let jsStart = code.indexOf('_call_function(');
+            if(jsStart > 0) {
+                let jsEnd = code.indexOf(')!', jsStart);
+                if(jsEnd > jsStart) {
+                    let jsPart = code.substring(jsStart, jsEnd + 2);
+                    let newJsPart = jsPart;
+
+                    for(let [paramId, mapping] of Object.entries(paramMapping)) {
+                        let oldVal = mapping.old;
+                        let newVal = mapping.new;
+
+                        // Replace string: ("oldVal") -> ("newVal")
+                        newJsPart = newJsPart.split(`("${oldVal}")`).join(`("${newVal}")`);
+                        // Replace number: (oldVal) -> (newVal) - be careful not to replace partial matches
+                        if(!isNaN(oldVal)) {
+                            newJsPart = newJsPart.split(`(${oldVal})`).join(`(${newVal})`);
+                        }
+                    }
+
+                    newCode = newCode.substring(0, jsStart) + newJsPart + newCode.substring(jsEnd + 2);
+                }
+            }
+
+            // Create action object for PasteFinal
+            let newId = Date.now().toString();
+            let actionObj = {
+                id: newId,
+                name: comment || '',
+                code: newCode,
+                parentid: String(template.get('parentid') || 0),
+                color: template.get('color') || ''
+            };
+
+            // Use PasteFinal like other methods do
+            window.App.overlay.show();
+            let ids = _MainView.PasteFinal(JSON.stringify([actionObj]), true);
+
+            if(!ids || ids.length === 0) {
+                window.App.overlay.hide();
+                return {success: false, error: "PasteFinal returned empty"};
+            }
+
+            // Find the new task
+            let newTask = FindTaskById(ids[0]);
+            if(!newTask) {
+                window.App.overlay.hide();
+                return {success: false, error: "New task not found after paste"};
+            }
+
+            // Compile the action
+            await new Promise(resolve => {
+                _ActionUpdater.model.once('finish', resolve).set({
+                    tasks: App.utils.filterTasks('all', [newTask]),
+                    isStarted: true,
+                });
+            });
+
+            window.App.overlay.hide();
+
+            // Check if compilation succeeded
+            let compileSuccess = _ActionUpdater.model.isSuccessfulUpdate();
+            if(!compileSuccess) {
+                // Delete failed action
+                await this.DeleteActions(ids);
+                return {
+                    success: false,
+                    error: "Action compilation failed - check if resource exists",
+                    debug_code: newCode.substring(0, 300)
+                };
+            }
+
+            return {
+                success: true,
+                action_id: ids[0],
+                updated_params: paramMapping
+            };
+
+        } catch(e) {
+            return {success: false, error: e.toString(), stack: e.stack};
         }
     }
 }

@@ -27,29 +27,60 @@ def find_helperipc_dir(start_path: Optional[Path] = None) -> Path:
     """
     Auto-detect helperipc directory relative to exe location.
 
+    Priority:
+    1. BAS_IPC_DIR environment variable
+    2. Search up from exe location for helperipc in BAS structure (apps/VERSION/helperipc)
+    3. Search common BAS installation paths
+    4. Fallback to exe directory
+
     Structure examples:
     - D:/BAS/App/apps/29.6.1/Worker.31/bas_mcp.exe -> D:/BAS/App/apps/29.6.1/helperipc
     - D:/BAS/App/apps/29.6.1/bas_mcp.exe -> D:/BAS/App/apps/29.6.1/helperipc
     """
+    import os
+    import sys
+
+    # Priority 1: Environment variable
+    env_ipc = os.environ.get('BAS_IPC_DIR')
+    if env_ipc:
+        return Path(env_ipc)
+
     if start_path is None:
         start_path = get_exe_directory()
 
-    # Search up to 3 levels up for helperipc folder
+    # Priority 2: Search up from exe location for BAS version folder
+    # BAS structure: .../apps/VERSION/helperipc (VERSION like 29.6.1)
+    # Exe can be in: .../apps/VERSION/Worker.XX/ or .../apps/VERSION/
     current = start_path
-    for _ in range(4):
-        helperipc = current / "helperipc"
-        if helperipc.exists():
-            return helperipc
-
-        # Also check if we can create it here (version folder pattern like 29.6.1)
-        if current.name and current.name[0].isdigit():
-            # Looks like version folder - create helperipc here
+    for _ in range(5):
+        # Check if current folder is a BAS version folder (parent is "apps")
+        if current.parent.name == "apps":
+            helperipc = current / "helperipc"
+            if helperipc.exists():
+                return helperipc
+            # Create if doesn't exist (BAS will create files here)
+            helperipc.mkdir(exist_ok=True)
             return helperipc
 
         parent = current.parent
         if parent == current:
             break
         current = parent
+
+    # Priority 3: Search common BAS installation paths
+    common_paths = [
+        Path("D:/BAS/BrowserAutomationStudio/apps"),
+        Path("C:/BAS/BrowserAutomationStudio/apps"),
+        Path.home() / "BAS/BrowserAutomationStudio/apps",
+    ]
+    for base in common_paths:
+        if base.exists():
+            # Find latest version folder
+            versions = sorted([d for d in base.iterdir() if d.is_dir() and d.name[0].isdigit()], reverse=True)
+            for ver in versions:
+                helperipc = ver / "helperipc"
+                if helperipc.exists():
+                    return helperipc
 
     # Fallback: create helperipc next to exe
     return start_path / "helperipc"
@@ -1220,6 +1251,197 @@ class BASClient:
         except Exception as e:
             return {"success": False, "error": str(e)}
 
+    async def get_module_schema(self, module_name: str, action_id: int = None) -> Dict:
+        """
+        Get schema for a BAS module including parameter descriptions, defaults, and variants.
+
+        Args:
+            module_name: Name of the module (e.g., "GoodXevilPaySolver_GXP_ReCaptcha_Bypass_No_Exten")
+            action_id: Optional action ID to get code-to-param mapping
+
+        Returns:
+            {
+                success: True/False,
+                module_name: "...",
+                params: [
+                    {
+                        id: "random_id",
+                        description: "Readable Name",
+                        data_type: "string" | "int" | "variable",
+                        default_value: "...",
+                        variants: ["option1", "option2"],  # if applicable
+                        code_name: "readable_name"  # from code field
+                    },
+                    ...
+                ],
+                code_params: {"readable_name": "readable_name", ...}
+            }
+        """
+        # First try to get code_params from BAS
+        bas_result = await self._call("get-module-schema", {
+            "module_name": module_name,
+            "action_id": action_id
+        }) or {}
+
+        result = {
+            "success": True,
+            "module_name": module_name,
+            "params": [],
+            "code_params": bas_result.get("code_params", {})
+        }
+
+        # Parse interface.js file directly from filesystem
+        interface_content = self._load_module_interface(module_name)
+        if interface_content:
+            result["params"] = self._parse_module_interface(interface_content, result["code_params"])
+            result["interface_loaded"] = True
+        else:
+            result["interface_loaded"] = False
+            result["interface_error"] = "Could not find interface file"
+
+        return result
+
+    def _load_module_interface(self, module_name: str) -> Optional[str]:
+        """Load interface.js file for a module from BAS installation."""
+        import re
+
+        # Extract module folder from module name
+        # e.g., GoodXevilPaySolver_GXP_ReCaptcha_Bypass_No_Exten -> GoodXevilPaySolver
+        parts = module_name.split('_')
+        module_folder = parts[0]
+
+        # Find BAS apps directory from IPC dir
+        # IPC dir is like: D:\BAS\...\apps\29.6.1\helperipc
+        bas_apps_dir = self.ipc_dir.parent if self.ipc_dir else None
+        if not bas_apps_dir:
+            return None
+
+        # Try different locations
+        interface_filename = f"{module_name}_interface.js"
+        search_paths = [
+            bas_apps_dir / "custom" / module_folder / interface_filename,
+        ]
+
+        # Also search in external folders (they have numeric IDs)
+        external_dir = bas_apps_dir / "external"
+        if external_dir.exists():
+            for subdir in external_dir.iterdir():
+                if subdir.is_dir():
+                    candidate = subdir / module_folder / interface_filename
+                    search_paths.append(candidate)
+
+        for path in search_paths:
+            if path.exists():
+                try:
+                    return path.read_text(encoding='utf-8')
+                except Exception:
+                    pass
+
+        return None
+
+    def _parse_module_interface(self, html: str, code_params: Dict) -> List[Dict]:
+        """Parse interface.js content to extract parameter definitions."""
+        import re
+        params = []
+
+        # Parse input_constructor calls
+        # Format: $('#input_constructor').html())({id:"xxx", ...}) %>
+        # The content between ({ and }) may contain nested braces like help: {...}
+        # We use a greedy match up to "}) %>" to capture the full content
+        constructor_pattern = r"#input_constructor'\)\.html\(\)\)\(\{(.+?)\}\s*\)\s*%>"
+        for match in re.finditer(constructor_pattern, html, re.DOTALL):
+            content = match.group(1)
+            param = self._parse_constructor_params(content, code_params)
+            if param:
+                params.append(param)
+
+        # Parse variable_constructor calls (for Save params)
+        var_pattern = r"#variable_constructor'\)\.html\(\)\)\(\{(.+?)\}\s*\)\s*%>"
+        for match in re.finditer(var_pattern, html, re.DOTALL):
+            content = match.group(1)
+            param = self._parse_variable_constructor(content)
+            if param:
+                params.append(param)
+
+        return params
+
+    def _parse_constructor_params(self, content: str, code_params: Dict) -> Optional[Dict]:
+        """Parse a single input_constructor content."""
+        import re
+        try:
+            param = {"type": "input"}
+
+            # Extract id
+            id_match = re.search(r'id:\s*"([^"]+)"', content)
+            if id_match:
+                param["id"] = id_match.group(1)
+
+            # Extract description (readable name)
+            desc_match = re.search(r'description:\s*"([^"]+)"', content)
+            if desc_match:
+                param["description"] = desc_match.group(1)
+
+            # Extract default_selector (type)
+            type_match = re.search(r'default_selector:\s*"([^"]+)"', content)
+            if type_match:
+                param["data_type"] = type_match.group(1)
+
+            # Extract variants (list of options)
+            variants_match = re.search(r'variants:\s*\[([^\]]+)\]', content)
+            if variants_match:
+                variants_str = variants_match.group(1)
+                items = []
+                # Parse array: "a", "b" or 0, 1
+                for item_match in re.finditer(r'"([^"]+)"|(\d+)', variants_str):
+                    items.append(item_match.group(1) or item_match.group(2))
+                param["variants"] = items
+
+            # Extract default value
+            value_string_match = re.search(r'value_string:\s*"([^"]*)"', content)
+            if value_string_match:
+                param["default_value"] = value_string_match.group(1)
+
+            value_number_match = re.search(r'value_number:\s*(\d+)', content)
+            if value_number_match:
+                param["default_value"] = int(value_number_match.group(1))
+
+            # Map to code param name if available
+            if param.get("description") and code_params:
+                lower_desc = param["description"].lower()
+                if lower_desc in code_params:
+                    param["code_name"] = code_params[lower_desc]
+
+            return param if param.get("id") else None
+        except Exception:
+            return None
+
+    def _parse_variable_constructor(self, content: str) -> Optional[Dict]:
+        """Parse a variable_constructor content."""
+        import re
+        try:
+            param = {"type": "variable"}
+
+            # Extract id
+            id_match = re.search(r'id:\s*"([^"]+)"', content)
+            if id_match:
+                param["id"] = id_match.group(1)
+
+            # Extract description
+            desc_match = re.search(r'description:\s*"([^"]+)"', content)
+            if desc_match:
+                param["description"] = desc_match.group(1)
+
+            # Extract default_variable
+            default_match = re.search(r'default_variable:\s*"([^"]+)"', content)
+            if default_match:
+                param["default_value"] = default_match.group(1)
+
+            param["data_type"] = "variable"
+
+            return param if param.get("id") else None
+        except Exception:
+            return None
+
     async def create_module_action_from_template(self, template_action_id: int,
                                                    new_values: Dict[str, str],
                                                    after_id: int = 0,
@@ -1304,6 +1526,41 @@ class BASClient:
 
         except Exception as e:
             return {"success": False, "error": str(e)}
+
+    async def clone_module_action(self, template_id: int, new_params: Dict[str, str],
+                                   comment: str = "") -> Dict:
+        """
+        Clone a module action with modified parameters.
+
+        This properly handles the complex structure of BAS module actions
+        (Dat JSON encoding, JavaScript code updates, etc.)
+
+        Args:
+            template_id: ID of existing module action to clone
+            new_params: Dict mapping parameter ID to new value, e.g.:
+                {
+                    "pmvdseyg": "{{apikey}}",     # Use resource for ApiKey
+                    "xknmvqbc": "Multibot",       # Change solver
+                }
+            comment: Optional comment for new action
+
+        Returns:
+            {
+                success: True/False,
+                action_id: new_id,
+                updated_params: {param_id: {old: "...", new: "..."}, ...}
+            }
+
+        Example workflow:
+            1. schema = await client.get_module_schema("ModuleName", template_id)
+            2. Find param IDs from schema: pmvdseyg -> ApiKey
+            3. result = await client.clone_module_action(template_id, {"pmvdseyg": "{{apikey}}"})
+        """
+        return await self._call("clone-module-action", {
+            "template_id": template_id,
+            "new_params": new_params,
+            "comment": comment
+        }) or {"success": False, "error": "No response"}
 
 
 async def main():
