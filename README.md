@@ -14,6 +14,10 @@ Download the latest release and copy files to your BAS installation:
 
 > **⚠️ Restart BAS after copying `index.js`!**
 
+Then click at this icon
+<img width="126" height="94" alt="image" src="https://github.com/user-attachments/assets/1535b7ba-f566-461a-b9c7-d351028cff8a" />
+
+
 ## Features
 
 - Create/edit/delete BAS actions
@@ -25,3 +29,4 @@ Download the latest release and copy files to your BAS installation:
 ## License
 
 MIT
+
